@@ -5,3 +5,5 @@
 .vscode/ipch
 cspell.json
 include/config.h
+.DS_Store
+*/.DS_Store
