@@ -101,3 +101,5 @@ detecteur-accords/
 └── src/
     └── main.cpp                   # orchestration (setup + loop)
 ```
+
+Fait avec ❤️ en France 🇫🇷 avec Mistral AI
