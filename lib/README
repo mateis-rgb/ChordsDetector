@@ -1,0 +1,217 @@
+# API — Interfaces et implémentations
+
+Référence unique des 6 bibliothèques privées : pour chaque module, l'**interface** (signatures, sémantique) **et** l'**implémentation** (algorithmes, structures internes). Chaque bibliothèque a aussi sa doc dédiée `lib/<nom>/docs/README.md`. La configuration globale reste dans `include/config.h` — seul fichier à éditer avant flash.
+
+## 🔗 Découverte des bibliothèques (LDF)
+
+Chaque module est une **bibliothèque privée PlatformIO** : son interface (`.h`) et son implémentation (`.cpp`) vivent ensemble dans `lib/<nom>/src/`. `main.cpp` inclut directement `midi_input.h`, `status_led.h`, `web_server.h` et `wifi_manager.h`. Le mode `lib_ldf_mode = chain+` remonte ensuite la chaîne : `web_server.cpp` inclut `chord_detector.h` et `web_page.h`, ce qui active aussi les bibliothèques `chord-detector` et `web-page`. Toutes les bibliothèques sont donc liées sans les déclarer dans `lib_deps`.
+
+## 📄 `include/config.h`
+
+| Constante | Type | Description |
+|---|---|---|
+| `WIFI_SSID` | `const char*` | SSID du réseau WiFi (2,4 GHz) |
+| `WIFI_PASSWORD` | `const char*` | Mot de passe WiFi |
+| `STATIC_IP_CIDR` | `const char*` | IP fixe en notation CIDR, ex. `"192.168.1.60/24"` (masque + passerelle déduits ; DHCP si invalide) |
+| `GATEWAY_OVERRIDE` | `const char*` | Passerelle forcée, ex. `"192.168.1.254"` ; `""` = `x.x.x.1` du réseau |
+| `HOSTNAME` | `const char*` | Nom mDNS → `http://<HOSTNAME>.local` |
+| `RGB_LED_PIN` | `int` | Broche de la WS2812 intégrée (48 la plupart des N16R8, 38 sur DevKitC-1 v1.1) |
+| `LED_BRIGHTNESS` | `uint8_t` | Luminosité LED 0–255 (50 conseillé) |
+| `LED_BLINK_PERIOD_MS` | `uint32_t` | Demi-période du clignotement (400 ms) |
+| `WIFI_CONNECT_TIMEOUT_MS` | `uint32_t` | Attente maximale de connexion WiFi (15 000 ms) |
+| `BROADCAST_PERIOD_MS` | `uint32_t` | Période du broadcast d'état vers les clients WebSocket (2 000 ms) |
+
+## 🎼 chord-detector — `namespace chords` (`lib/chord-detector/src/`)
+
+Reconnaissance d'accords, pure et sans dépendance matérielle : entrée = classes de hauteur jouées, sortie = nom d'accord. Testable sur PC.
+
+### Interface
+
+```cpp
+struct ChordInfo {
+    bool found    = false;  // un accord (ou une note) a-t-il été reconnu ?
+    char name[32] = {0};    // "C", "Cm7", "Cmaj7/E" (renversement), "C4" (note seule)
+    int  rootPc   = -1;     // classe de hauteur de la fondamentale (0–11)
+    int  bassPc   = -1;     // classe de hauteur de la note la plus grave (0–11)
+};
+
+extern const char* const NOTE_NAMES[12];  // "C", "C#", "D", … index = classe de hauteur
+
+ChordInfo detect(uint16_t pcMask, int8_t lowestMidi, uint8_t activeCount);
+void      noteName(uint8_t midi, char* out, size_t len);  // "C4" pour MIDI 60, out ≥ 6 octets
+```
+
+**Règles de détection** : 28 gabarits (triades → 13e) ; quinte optionnelle sur les accords à 4 notes et plus, tierce optionnelle sur les 11e/13e ; ambiguïtés tranchées par la basse (`C6` vs `Am7`) ; renversement suffixé `C/E` ; toutes les notes doivent être expliquées par le gabarit.
+
+### Implémentation
+
+- `NOTE_NAMES[12]` : noms de notes partagés avec les autres modules.
+- `namespace { … }` (interne) :
+  - `struct Iv { uint8_t s; bool opt; }` — un intervalle depuis la fondamentale (demi-tons) et son caractère optionnel ;
+  - `struct Tpl { const char* suffix; const Iv* iv; uint8_t n; }` — un gabarit d'accord ;
+  - `IV_MAJ, IV_MIN, IV_5, IV_SUS, IV_DIM, IV_DIM7, IV_M7B5, IV_7, IV_M7, IV_MAJ7, IV_MM7, IV_7B5, IV_7S5, IV_AUG7, IV_6, IV_M6, IV_69, IV_9, IV_M9, IV_MAJ9, IV_ADD, IV_11, IV_M11, IV_MAJ11, IV_13, IV_M13, IV_MAJ13` — les intervalles de chaque famille ;
+  - `TEMPLATES[]` / `N_TEMPLATES` — 28 gabarits (`""`, `m`, `5`, `sus`, `dim`, `dim7`, `m7b5`, `aug`, `aug7`, `maj7`, `mM7`, `6`, `m6`, `6/9`, `7`, `m7`, `7-5`, `7+5`, `9`, `m9`, `maj9`, `add`, `11`, `m11`, `maj11`, `13`, `m13`, `maj13`) ;
+  - `bool matches(const Tpl&, uint8_t root, uint16_t pcMask, int& required, int& presentOpt)` — teste un couple (gabarit, fondamentale) : tous les intervalles requis présents, aucune note jouée non expliquée ; renvoie les compteurs pour le score.
+- `detect()` : note seule / unisson gérés en accélérateur, sinon balayage 12 fondamentales × 28 gabarits ; score = `10×requis + optionnels présents + 1000 si la fondamentale est la basse` ; renversement suffixé `/basse`.
+- `noteName()` : `midi/12 - 1` pour l'octave (MIDI 60 → `C4`).
+
+### Doc dédiée
+
+`lib/chord-detector/docs/README.md`
+
+## 🎹 midi-input — `namespace midi` (`lib/midi-input/src/`)
+
+Transport USB Host MIDI (bibliothèque `ESP32_Host_MIDI`) et suivi des notes actives. Seul module qui touche à l'USB.
+
+### Interface
+
+| Signature | Description |
+|---|---|
+| `void setup()` | Enregistre le transport USB Host et démarre l'énumération. À appeler une fois dans `setup()`. |
+| `bool poll()` | Traite les événements MIDI arrivés. À appeler dans `loop()`. Retourne `true` si l'ensemble des notes actives a changé (→ déclenche un broadcast). |
+| `bool keyboardConnected()` | Un clavier MIDI est-il détecté sur le bus USB (énuméré et actif) ? |
+| `uint8_t activeNotes(uint8_t* out, uint8_t max)` | Copie les notes MIDI actives triées croissant dans `out[]`, retourne le nombre écrit (≤ `max`, ex. 32). |
+
+### Implémentation
+
+- Interne : l'instance `USBConnection usbHost` du transport hôte, le tableau `bool active[128]` des notes maintenues, et `int64_t lastIndex` (anti-doublon de la file, index signés 64 bits) ;
+- `applyEvent(const MIDIEventData& ev, bool& changed)` — traduit un événement de la file en maintien/relâchement : `NoteOn vel>0` → note active ; `NoteOff` ou `NoteOn vel=0` → note inactive ; clamp `noteNumber ≤ 127` ; statuts `MIDI_NOTE_ON` / `MIDI_NOTE_OFF` ;
+- `poll()` : `midiHandler.task()` (draine l'USB vers la file), puis parcours de `midiHandler.getQueue()` en ignorant les index déjà traités ;
+- `activeNotes()` : simple balayage croissant 0–127, donc la sortie est naturellement triée (`out[0]` = la plus grave = la basse).
+
+### Doc dédiée
+
+`lib/midi-input/docs/README.md`
+
+## 💡 status-led — `namespace statusled` (`lib/status-led/src/`)
+
+Pilotage de la LED RGB (WS2812) intégrée, reflet de l'état système. Machine d'état sans blocage.
+
+### Interface
+
+| Signature | Description |
+|---|---|
+| `void begin()` | LED éteinte au démarrage. |
+| `void update(bool wifiOk, bool comOk)` | À appeler dans `loop()` : applique la couleur d'état. |
+
+| État | Couleur | Effet |
+|---|---|---|
+| WiFi HS + clavier HS | 🔴 rouge | clignote |
+| WiFi OK + clavier HS | 🟢 vert | clignote |
+| WiFi OK + clavier OK | 🔵 bleu | fixe (état nominal) |
+| WiFi HS + clavier OK | 🟡 jaune | clignote |
+
+### Implémentation
+
+- Interne : `set(r,g,b)` — un simple `neopixelWrite(RGB_LED_PIN, …)` ;
+- `update()` : machine d'état sans blocage, clignotement par `millis()` modulo `LED_BLINK_PERIOD_MS` ; le bleu est fixe, les autres clignotent.
+
+### Doc dédiée
+
+`lib/status-led/docs/README.md`
+
+## 📡 wifi-manager — `namespace wifi` (`lib/wifi-manager/src/`)
+
+Connexion WiFi station avec IP fixe, mDNS et reconnexion automatique.
+
+### Interface
+
+| Signature | Description |
+|---|---|
+| `extern bool connected` | État de connexion courant (mis à jour par `setup()` puis `maintain()`). |
+| `void setup()` | Configure l'IP fixe depuis `STATIC_IP_CIDR` (repli DHCP), connecte au réseau, démarre mDNS si succès. Bloquant jusqu'à `WIFI_CONNECT_TIMEOUT_MS`. |
+| `void maintain()` | Met à jour `connected` ; en cas de perte, relance la connexion toutes les 5 s. À appeler dans `loop()`. |
+
+### Implémentation
+
+- Interne : `parseCidr(const char* cidr, IPAddress& ip, IPAddress& mask, IPAddress& gw)` — découpe `"a.b.c.d/p"`, calcule le masque par décalage, la passerelle = première adresse du réseau (`|1` sur le dernier octet) ;
+- `setup()` : `WiFi.config(ip, gw, mask, gw)` (DNS = passerelle ; `GATEWAY_OVERRIDE` prioritaire si non vide), attente bloquante ≤ `WIFI_CONNECT_TIMEOUT_MS`, puis `MDNS.begin(HOSTNAME)` + service `http/tcp` ;
+- `maintain()` : lecture de `WiFi.status()`, `disconnect()+reconnect()` au plus toutes les 5 s.
+
+### Doc dédiée
+
+`lib/wifi-manager/docs/README.md`
+
+## 🌐 web-server — `namespace web` (`lib/web-server/src/`)
+
+Serveur HTTP + WebSocket temps réel (ESPAsyncWebServer). Construit l'état JSON à partir des autres modules.
+
+### Interface
+
+| Signature | Description |
+|---|---|
+| `void setup()` | Déclare les routes (`/`, `/health`), le WebSocket `/ws` et démarre le serveur. À appeler après `wifi::setup()`. |
+| `void broadcastState()` | Pousse l'état complet (accord, notes, WiFi, clavier) à tous les clients WebSocket. À appeler dès qu'une note change. |
+| `void loop()` | Broadcast périodique (toutes les `BROADCAST_PERIOD_MS`) pour rafraîchir le statut + nettoyage des clients morts. À appeler dans `loop()`. |
+
+### Routes HTTP
+
+| Route | Méthode | Réponse |
+|---|---|---|
+| `/` | GET | `web_page::INDEX_HTML` (`text/html`, PROGMEM) |
+| `/health` | GET | `{"wifi": true, "com": true}` (`application/json`) |
+
+### Protocole WebSocket (`/ws`)
+
+**ESP32 → navigateur** (à chaque changement de notes **et** toutes les `BROADCAST_PERIOD_MS`) :
+
+```json
+{
+  "type": "state",
+  "count": 4,
+  "chord": "Cmaj7",
+  "wifi": true,
+  "com": true,
+  "notes": [{"n": "C4", "m": 60}, {"n": "E4", "m": 64}, {"n": "G4", "m": 67}, {"n": "B4", "m": 71}]
+}
+```
+
+- `chord` : nom de l'accord, `""` si rien ou non reconnu ; `notes[].n` = nom+octave, `notes[].m` = numéro MIDI.
+
+**Navigateur → ESP32** : `{"type": "ping", "id": 7}` — **ESP32 → navigateur** (écho immédiat au client, pas de diffusion) : `{"type": "pong", "id": 7}`.
+
+### Implémentation
+
+- Interne : `AsyncWebServer server(80)`, `AsyncWebSocket ws("/ws")`, `lastBroadcastMs` (périodicité) ;
+- `buildStateJson()` : récupère les notes via `midi::activeNotes()`, calcule le masque de classes de hauteur et la basse, appelle `chords::detect()`, sérialise (pas de ArduinoJson, allocation unique via `String::reserve`) ;
+- `onWsEvent()` : à `WS_EVT_CONNECT` envoie l'état complet au nouveau client ; à `WS_EVT_DATA` répond au ping du test de réactivité par un pong immédiat (écho direct au client, pas de diffusion).
+
+### Doc dédiée
+
+`lib/web-server/docs/README.md`
+
+## 🖼️ web-page — `namespace web_page` (`lib/web-page/src/`)
+
+### Interface
+
+| Symbole | Description |
+|---|---|
+| `extern const char INDEX_HTML[]` | La page web complète « Scène Néon », stockée en flash (PROGMEM) et servie sur `/`. |
+
+### Implémentation
+
+- `INDEX_HTML[] PROGMEM` : la page complète « Scène Néon » (chaîne brute C++). Côté navigateur :
+  - **rendu** : décomposition de l'accord en fondamentale + suffixe néon + basse grise ; chips de notes re-créées seulement si l'ensemble change ;
+  - **WebSocket** : reconnexion automatique avec backoff exponentiel (250 ms → 5 s max) ;
+  - **test de réactivité** : 20 pings espacés de 70 ms, RTT min/moy/max + aller simple estimé ;
+  - **mode éco** : classe `body.eco` persistée en `localStorage` (`accords-mode`), coupe halos/grille/animations ;
+  - **thème** : suit `prefers-color-scheme` (badge indicatif, aucune intervention possible sur l'OS).
+
+### Doc dédiée
+
+`lib/web-page/docs/README.md`
+
+## 🚦 `src/main.cpp` — orchestration
+
+Aucune logique métier : `setup()` appelle les 4 `setup()` dans l'ordre LED → WiFi → Web → MIDI ; `loop()` enchaîne `midi::poll()` (si changement → `web::broadcastState()` immédiat), `wifi::maintain()`, `statusled::update()` et `web::loop()` (périodique + nettoyage).
+
+## 🔁 Cycle de vie typique
+
+```
+setup() :  statusled::begin() → wifi::setup() → web::setup() → midi::setup()
+loop()  :  notesChanged = midi::poll()
+           wifi::maintain()
+           statusled::update(wifi::connected, midi::keyboardConnected())
+           si notesChanged → web::broadcastState()
+           web::loop()
+```
