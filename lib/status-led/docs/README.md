@@ -11,7 +11,7 @@ Pilote la WS2812 intégrée de l'ESP32-S3 comme reflet immédiat de l'état syst
 
 ## 🔗 Dépendances
 
-- Arduino core (`neopixelWrite`) ;
+- Arduino core (`rgbLedWrite`, ex-`neopixelWrite`, déprécié dans le core 3.3.x) ;
 - `include/config.h` :
 
 | Constante | Rôle |
@@ -25,7 +25,7 @@ Pilote la WS2812 intégrée de l'ESP32-S3 comme reflet immédiat de l'état syst
 | Signature | Description |
 |---|---|
 | `void begin()` | LED éteinte au démarrage. |
-| `void update(bool wifiOk, bool comOk)` | À appeler dans `loop()` : applique la couleur d'état correspondante. |
+| `void update(bool wifiOk, bool comOk, bool appOk)` | À appeler dans `loop()` : applique la couleur d'état (bleu clignotant si une app est connectée). |
 
 ### Couleurs d'état
 
@@ -34,12 +34,13 @@ Pilote la WS2812 intégrée de l'ESP32-S3 comme reflet immédiat de l'état syst
 | WiFi HS + clavier HS | 🔴 rouge | clignote |
 | WiFi OK + clavier HS | 🟢 vert | clignote |
 | WiFi OK + clavier OK | 🔵 bleu | **fixe** (état nominal) |
+| WiFi OK + clavier OK + app connectée | 🔵 bleu | clignote |
 | WiFi HS + clavier OK | 🟡 jaune | clignote |
 
 ## ⚙️ Implémentation
 
-- `set(r, g, b)` — un simple `neopixelWrite(RGB_LED_PIN, …)` ;
-- `update()` : machine d'état sans blocage, clignotement par `millis()` modulo `LED_BLINK_PERIOD_MS` ; le bleu est fixe, les autres couleurs clignotent.
+- `set(r, g, b)` — un simple `rgbLedWrite(RGB_LED_PIN, …)` ;
+- `update()` : machine d'état sans blocage, clignotement par `millis()` modulo `LED_BLINK_PERIOD_MS` ; le bleu est fixe sans app connectée et **clignote quand une app est connectée** (3e paramètre `appOk`), les autres couleurs clignotent.
 
 ## 💡 Exemple
 

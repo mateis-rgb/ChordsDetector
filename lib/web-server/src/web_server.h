@@ -19,4 +19,8 @@ void broadcastState();
 // cf. config.h) pour rafraîchir le statut + nettoyage des clients morts.
 void loop();
 
+// Au moins une app native est-elle connectée au WebSocket ?
+// (identification « hello » — utilisée par la LED d'état : bleu clignotant)
+bool appConnected();
+
 } // namespace web

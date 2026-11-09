@@ -1,58 +1,93 @@
-#include "midi_input.h"
+#include "wifi_manager.h"
+#include "config.h"
+#include "settings_store.h"
 
 #include <Arduino.h>
-#include <ESP32_Host_MIDI.h>
-#include <USBConnection.h>
+#include <ESPmDNS.h>
+#include <WiFi.h>
 
-namespace midi {
+namespace wifi {
+
+bool connected = false;
 
 namespace {
 
-USBConnection usbHost;              // le clavier, branché sur le port OTG
-bool     active[128] = {false};     // notes MIDI actuellement maintenues
-int64_t  lastIndex   = 0;           // anti-doublon de la file d'événements
+uint32_t lastTryMs = 0;
 
-void applyEvent(const MIDIEventData& ev, bool& changed) {
-    if (ev.noteNumber > 127) return;
+// "192.168.1.60/24" -> ip / masque / passerelle (première adresse du réseau).
+bool parseCidr(const char* cidr, IPAddress& ip, IPAddress& mask, IPAddress& gw) {
+    String s(cidr);
+    int slash = s.indexOf('/');
+    if (slash < 0 || !ip.fromString(s.substring(0, slash))) return false;
+    int p = s.substring(slash + 1).toInt();
+    if (p < 0 || p > 32) return false;
 
-    if (ev.statusCode == MIDI_NOTE_ON && ev.velocity7 > 0) {
-        if (!active[ev.noteNumber]) changed = true;
-        active[ev.noteNumber] = true;
-    } else if (ev.statusCode == MIDI_NOTE_OFF ||
-               (ev.statusCode == MIDI_NOTE_ON && ev.velocity7 == 0)) {
-        if (active[ev.noteNumber]) changed = true;
-        active[ev.noteNumber] = false;
+    uint32_t m = (p == 0) ? 0u : (0xFFFFFFFFu << (32 - p));
+    uint8_t mb[4], gb[4];
+    for (int i = 0; i < 4; i++) {
+        mb[i] = (m >> (8 * (3 - i))) & 0xFF;
+        gb[i] = ip[i] & mb[i];
     }
+    gb[3] |= 1;   // passerelle par défaut : x.x.x.1
+    mask = IPAddress(mb[0], mb[1], mb[2], mb[3]);
+    gw   = IPAddress(gb[0], gb[1], gb[2], gb[3]);
+    return true;
 }
 
 } // namespace
 
 void setup() {
-    midiHandler.addTransport(&usbHost);
-    usbHost.begin();                 // démarre l'USB Host (core 0)
-    midiHandler.begin();
-    Serial.println("[MIDI] USB Host démarré — branchez le clavier…");
-}
+    // Réglages persistants (NVS) > défauts de config.h.
+    // settings::setup() charge la configuration appliquée depuis l'app.
+    settings::setup();
+    const settings::Config& cfg = settings::get();
 
-bool poll() {
-    midiHandler.task();              // alimente la file d'événements
-
-    bool changed = false;
-    for (const auto& ev : midiHandler.getQueue()) {
-        if (ev.index <= lastIndex) continue;
-        lastIndex = ev.index;
-        applyEvent(ev, changed);
+    IPAddress ip, mask, gw;
+    if (cfg.ipCidr.isEmpty()) {
+        Serial.println("[WiFi] DHCP (aucune IP fixe configurée)");
+    } else if (parseCidr(cfg.ipCidr.c_str(), ip, mask, gw)) {
+        if (cfg.gateway.length() > 0) gw.fromString(cfg.gateway);
+        WiFi.config(ip, gw, mask, gw);   // DNS = passerelle
+        Serial.printf("[WiFi] IP fixe : %s (gw %s)\n",
+                      ip.toString().c_str(), gw.toString().c_str());
+    } else {
+        Serial.println("[WiFi] CIDR invalide -> DHCP");
     }
-    return changed;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(cfg.hostname.c_str());
+    WiFi.begin(cfg.ssid.c_str(), cfg.password.c_str());
+
+    Serial.printf("[WiFi] Connexion à \"%s\" ", cfg.ssid.c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
+        delay(100);
+        Serial.print(".");
+    }
+    connected = (WiFi.status() == WL_CONNECTED);
+    Serial.println(connected ? " OK" : " ÉCHEC");
+
+    if (connected) {
+        Serial.printf("[WiFi] http://%s.local ou http://%s\n",
+                      cfg.hostname.c_str(), WiFi.localIP().toString().c_str());
+        if (MDNS.begin(cfg.hostname.c_str())) {
+            MDNS.addService("http", "tcp", 80);
+            // Service dédié à la découverte automatique par l'app
+            // (cf. DiscoveryService.swift — NWBrowser _chordsdetector._tcp)
+            MDNS.addService("chordsdetector", "tcp", 80);
+            Serial.printf("[mDNS] http://%s.local (+ service _chordsdetector._tcp)\n",
+                          cfg.hostname.c_str());
+        }
+    }
 }
 
-bool keyboardConnected() { return usbHost.isConnected(); }
-
-uint8_t activeNotes(uint8_t* out, uint8_t max) {
-    uint8_t n = 0;
-    for (int m = 0; m < 128 && n < max; m++)
-        if (active[m]) out[n++] = (uint8_t)m;
-    return n;
+void maintain() {
+    connected = (WiFi.status() == WL_CONNECTED);
+    if (!connected && millis() - lastTryMs > 5000) {
+        lastTryMs = millis();
+        WiFi.disconnect();
+        WiFi.reconnect();
+    }
 }
 
-} // namespace midi
+} // namespace wifi
