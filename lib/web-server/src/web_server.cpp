@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
+#include <Update.h>
 
 #include <unordered_set>
 
@@ -42,7 +43,8 @@ String buildStateJson() {
     String s;
     s.reserve(320);
     s += "{\"type\":\"state\",\"count\":";  s += count;
-    s += ",\"chord\":\"";                   s += info.name;
+    s += ",\"fw\":\"";                      s += FW_VERSION;
+    s += "\",\"chord\":\"";                   s += info.name;
     s += "\",\"wifi\":";                   s += (wifi::connected ? "true" : "false");
     s += ",\"com\":";                       s += (midi::keyboardConnected() ? "true" : "false");
     s += ",\"notes\":[";
@@ -86,6 +88,7 @@ String buildConfigJson() {
     const settings::Config& c = settings::get();
     String s;
     s += "{\"type\":\"config\",\"v\":2";
+    s += ",\"fw\":\"";       s += jsonEscape(FW_VERSION);
     s += ",\"ssid\":\"";         s += jsonEscape(c.ssid);
     s += "\",\"hasPass\":";      s += (c.password.length() > 0) ? "true" : "false";
     s += ",\"ip\":\"";           s += jsonEscape(c.ipCidr);
@@ -156,6 +159,42 @@ void setup() {
                   String("{\"wifi\":") + (wifi::connected ? "true" : "false") +
                   ",\"com\":" + (midi::keyboardConnected() ? "true" : "false") + "}");
     });
+
+    // ---- OTA (protocole v1.3) : POST du firmware binaire sur /update ----
+    // L'app envoie le .bin de la release GitHub tel quel (octet-stream,
+    // Content-Length = taille exacte). Écriture sur la partition inactive,
+    // puis redémarrage — rollback automatique si le nouveau firmware ne
+    // démarre pas. Repli USB toujours possible en cas de problème.
+    server.on("/update", HTTP_POST,
+              [](AsyncWebServerRequest* req) {
+                  // Réponse envoyée à la fin de l'upload (cf. onUpload).
+              },
+              [](AsyncWebServerRequest* req, String filename,
+                 size_t index, uint8_t* data, size_t len, bool final) {
+                  if (index == 0) {
+                      Serial.printf("[OTA] Réception %s (%u octets)\n",
+                                    filename.isEmpty() ? "(binaire)" : filename.c_str(),
+                                    (unsigned)req->contentLength());
+                      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                          Update.printError(Serial);
+                      }
+                  }
+                  if (len > 0 && Update.write(data, len) != len) {
+                      Update.printError(Serial);
+                  }
+                  if (final) {
+                      if (Update.end(true)) {
+                          Serial.printf("[OTA] Firmware écrit (%u octets) — redémarrage\n",
+                                        (unsigned)(index + len));
+                          req->send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+                          rebootRequested = true;   // redémarré dans loop(), après la réponse
+                      } else {
+                          Update.printError(Serial);
+                          req->send(500, "application/json", "{\"ok\":false}");
+                      }
+                  }
+              });
+
     server.begin();
     Serial.println("[Web] Serveur démarré sur le port 80");
 }
